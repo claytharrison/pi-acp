@@ -327,6 +327,15 @@ export class PiAcpSession {
   private cancelRequested = false
   /** Whether pi started an agent run for the current ACP turn (see settleIfNoRun). */
   private sawAgentStart = false
+  /**
+   * Some models stream reasoning interleaved with the answer. Forwarding each
+   * thinking delta as it arrives makes clients start a thought block mid-sentence
+   * ("Let [thought] me check..."). Once an assistant message has started its
+   * visible text, further thinking is held here and flushed when the message ends
+   * or reaches a tool call.
+   */
+  private textStartedInMessage = false
+  private heldThought = ''
 
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
@@ -594,6 +603,13 @@ export class PiAcpSession {
    * the ACP `session/prompt` would hang. After the prompt is acknowledged, if no run
    * has started and pi reports it isn't streaming, end the turn here.
    */
+  private flushHeldThought(): void {
+    if (!this.heldThought) return
+    const text = this.heldThought
+    this.heldThought = ''
+    this.emit({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } satisfies ContentBlock })
+  }
+
   private async settleIfNoRun(): Promise<void> {
     const turn = this.pendingTurn
     if (!turn) return
@@ -670,8 +686,21 @@ export class PiAcpSession {
       case 'message_update': {
         const ame = (ev as any).assistantMessageEvent
 
+        if (ame?.type === 'start') {
+          this.flushHeldThought()
+          this.textStartedInMessage = false
+          break
+        }
+
+        if (ame?.type === 'done' || ame?.type === 'error') {
+          this.flushHeldThought()
+          this.textStartedInMessage = false
+          break
+        }
+
         // Stream assistant text.
         if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
+          this.textStartedInMessage = true
           this.emit({
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: ame.delta } satisfies ContentBlock
@@ -680,11 +709,22 @@ export class PiAcpSession {
         }
 
         if (ame?.type === 'thinking_delta' && typeof ame.delta === 'string') {
+          if (this.textStartedInMessage) {
+            // Don't split the visible text; show this reasoning after it.
+            this.heldThought += ame.delta
+            break
+          }
           this.emit({
             sessionUpdate: 'agent_thought_chunk',
             content: { type: 'text', text: ame.delta } satisfies ContentBlock
           })
           break
+        }
+
+        if (ame?.type === 'toolcall_start') {
+          // the message's text is complete; release held reasoning before the tool call
+          this.flushHeldThought()
+          this.textStartedInMessage = false
         }
 
         // Surface tool calls ASAP so clients (e.g. Zed) can show a tool-in-use/loading UI
@@ -984,6 +1024,10 @@ export class PiAcpSession {
         // `pi.sendMessage({ display: true, ... })` (role "custom"). pi shows them in
         // its TUI; forward them to the client as agent text so ACP clients do too.
         const msg = (ev as any).message
+        if (msg?.role === 'assistant') {
+          this.flushHeldThought()
+          this.textStartedInMessage = false
+        }
         if (msg?.role === 'custom' && msg.display) {
           const text = customMessageText(msg.content)
           if (text) {
@@ -1006,6 +1050,8 @@ export class PiAcpSession {
       }
 
       case 'agent_settled': {
+        this.flushHeldThought()
+        this.textStartedInMessage = false
         // Ensure all updates derived from pi events are delivered before we resolve
         // the ACP `session/prompt` request.
         void this.flushEmits().finally(() => {
