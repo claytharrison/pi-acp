@@ -66,8 +66,11 @@ export class FakePiRpcProcess {
     this.extensionUiResponses.push(response)
   }
 
+  /** What getState() returns (tests can set e.g. { isStreaming: true }). */
+  state: any = {}
+
   async getState(): Promise<any> {
-    return {}
+    return this.state
   }
 
   async getAvailableModels(): Promise<any> {

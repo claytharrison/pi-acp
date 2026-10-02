@@ -325,6 +325,8 @@ export class PiAcpSession {
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
   private cancelRequested = false
+  /** Whether pi started an agent run for the current ACP turn (see settleIfNoRun). */
+  private sawAgentStart = false
 
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
@@ -586,6 +588,37 @@ export class PiAcpSession {
     this.bashOutputSnapshots.delete(toolCallId)
   }
 
+  /**
+   * Extension commands (e.g. `/mycommand`) are handled by pi when the prompt is
+   * accepted and may never start an agent run, so no `agent_settled` follows and
+   * the ACP `session/prompt` would hang. After the prompt is acknowledged, if no run
+   * has started and pi reports it isn't streaming, end the turn here.
+   */
+  private async settleIfNoRun(): Promise<void> {
+    const turn = this.pendingTurn
+    if (!turn) return
+    await new Promise(r => setTimeout(r, 300))
+    if (this.sawAgentStart || this.pendingTurn !== turn) return
+    let streaming = true
+    try {
+      const st = (await this.proc.getState()) as any
+      streaming = Boolean(st?.isStreaming)
+    } catch {
+      return // can't tell; leave it to agent_settled / process exit
+    }
+    if (streaming || this.sawAgentStart || this.pendingTurn !== turn) return
+    await this.flushEmits()
+    if (this.pendingTurn !== turn) return
+    turn.resolve(this.cancelRequested ? 'cancelled' : 'end_turn')
+    this.pendingTurn = null
+    this.emit({
+      sessionUpdate: 'session_info_update',
+      _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+    })
+    const next = this.turnQueue.shift()
+    if (next) this.startTurn(next)
+  }
+
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
 
@@ -600,7 +633,11 @@ export class PiAcpSession {
     // Kick off pi, but completion is determined by pi events, not the RPC response.
     // The prompt RPC only acknowledges acceptance; retry, compaction, or queued
     // continuations may emit multiple `agent_end` events before `agent_settled`.
-    this.proc.prompt(t.message, t.images).catch(err => {
+    this.sawAgentStart = false
+    this.proc
+      .prompt(t.message, t.images)
+      .then(() => this.settleIfNoRun())
+      .catch(err => {
       // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
       // Also ensure we flush any already-enqueued updates first.
       void this.flushEmits().finally(() => {
@@ -937,7 +974,22 @@ export class PiAcpSession {
       }
 
       case 'agent_start': {
-        // No adapter state to update; ACP turn completion is driven by `agent_settled`.
+        // ACP turn completion is driven by `agent_settled`; just note that a run started.
+        this.sawAgentStart = true
+        break
+      }
+
+      case 'message_end': {
+        // Extensions can add messages to the conversation with
+        // `pi.sendMessage({ display: true, ... })` (role "custom"). pi shows them in
+        // its TUI; forward them to the client as agent text so ACP clients do too.
+        const msg = (ev as any).message
+        if (msg?.role === 'custom' && msg.display) {
+          const text = customMessageText(msg.content)
+          if (text) {
+            this.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
+          }
+        }
         break
       }
 
@@ -1197,4 +1249,17 @@ function toToolKind(toolName: string): ToolKind {
     default:
       return 'other'
   }
+}
+
+
+/** Text of a pi custom message's content (string, or text blocks). */
+export function customMessageText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .filter((c: any) => c && c.type === 'text' && typeof c.text === 'string')
+      .map((c: any) => c.text)
+      .join('\n')
+  }
+  return ''
 }
